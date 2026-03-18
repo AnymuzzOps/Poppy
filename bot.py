@@ -1,469 +1,494 @@
-"""
-Crypto Paper Trading Bot
-Stack: Bybit Public API (sin auth, sin geo-bloqueo) + Groq AI + Telegram
-Deploy: Railway.app (24/7)
-"""
-
-import os
 import json
-import time
 import logging
-import threading
+import os
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from html import unescape
+from typing import Iterable
+from urllib.parse import quote_plus, urljoin, urlparse
+
 import requests
-import pandas as pd
-import numpy as np
 from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ─── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-GROQ_API_KEY     = os.environ["GROQ_API_KEY"]
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+DEFAULT_EVENT_DATE = os.getenv("DEFAULT_EVENT_DATE", "2026-03-18")
+SEARCH_RESULTS = int(os.getenv("SEARCH_RESULTS", "8"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "20"))
+SEARCH_LOCALE = os.getenv("SEARCH_LOCALE", "cl-es")
+MAX_EVENTS = int(os.getenv("MAX_EVENTS", "6"))
 
-INITIAL_BALANCE  = float(os.getenv("INITIAL_BALANCE", "1000"))
-SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL", "300"))
-TOP_N_VOLATILE   = int(os.getenv("TOP_N_VOLATILE", "10"))
-MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.20"))
-MIN_CONFIDENCE   = int(os.getenv("MIN_CONFIDENCE", "60"))
-HISTORY_FILE     = "trades_history.json"
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+session = requests.Session()
+session.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+)
 
-BYBIT_BASE       = "https://api.bybit.com"
-
-# ─── Clientes ────────────────────────────────────────────────────────────────
-groq_client = Groq(api_key=GROQ_API_KEY)
-
-# ─── Estado del portafolio ───────────────────────────────────────────────────
-portfolio = {
-    "usdt_balance": INITIAL_BALANCE,
-    "positions":    {},
-    "trades":       [],
-    "total_pnl":    0.0,
-    "cycle":        0,
+DATE_CUTOFF = datetime.fromisoformat(DEFAULT_EVENT_DATE).date()
+MAX_SOURCE_CHARS = 7000
+RELATIVE_DATE_TERMS = (
+    "hoy",
+    "mañana",
+    "esta semana",
+    "este fin de semana",
+    "próximo fin de semana",
+    "proximo fin de semana",
+    "próxima semana",
+    "proxima semana",
+)
+BLOCKED_DOMAINS = {
+    "instagram.com",
+    "www.instagram.com",
+    "m.instagram.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "youtube.com",
+    "www.youtube.com",
+    "youtu.be",
+    "facebook.com",
+    "www.facebook.com",
+    "x.com",
+    "www.x.com",
+    "twitter.com",
+    "www.twitter.com",
+}
+BLOCKED_SOURCE_TERMS = (
+    "multinivel",
+    "piramidal",
+    "network marketing",
+    "gana dinero",
+    "oportunidad de negocio",
+    "plan de compensación",
+    "afiliados",
+    "recluta",
+    "emprende sin inversión",
+    "crypto academy",
+)
+EXCLUSIVE_TOKENS = (
+    "exclus",
+    "vip",
+    "privad",
+    "cupos limitados",
+    "degust",
+    "cata",
+    "inaugur",
+    "apertura",
+    "lanzamiento",
+    "gratis",
+    "premium",
+)
+SEARCH_QUERIES = [
+    'site:ticketmaster.cl Santiago Chile 2026 inauguración OR lanzamiento VIP',
+    'site:eventrid.cl Santiago Chile 2026 degustación gratis OR cata gratis',
+    'site:welcu.com Santiago Chile 2026 evento exclusivo inauguración',
+    'site:finde.latercera.com Santiago Chile 2026 degustación inauguración',
+    '"Santiago de Chile" 2026 inauguración "cupos limitados"',
+    '"Santiago de Chile" 2026 "degustación gratis"',
+]
+MONTHS = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
 }
 
-# ─── Bybit Public API ─────────────────────────────────────────────────────────
-def bybit_get(endpoint: str, params: dict = {}) -> Optional[dict]:
-    try:
-        r = requests.get(f"{BYBIT_BASE}{endpoint}", params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("retCode", -1) != 0:
-            log.error(f"Bybit error [{endpoint}]: {data.get('retMsg')}")
-            return None
-        return data.get("result")
-    except Exception as e:
-        log.error(f"Bybit API error [{endpoint}]: {e}")
-        return None
+
+@dataclass
+class SearchResult:
+    title: str
+    url: str
+    snippet: str
 
 
-def get_top_volatile_symbols(n: int = TOP_N_VOLATILE) -> list[str]:
-    """Retorna los N pares USDT con mayor variación de precio en 24h."""
-    result = bybit_get("/v5/market/tickers", {"category": "spot"})
-    if not result:
-        return []
-
-    tickers = result.get("list", [])
-    usdt_pairs = [
-        t for t in tickers
-        if t["symbol"].endswith("USDT")
-        and not any(x in t["symbol"] for x in ["DOWN", "UP", "BEAR", "BULL"])
-        and float(t.get("turnover24h", 0)) > 500_000
-    ]
-
-    usdt_pairs.sort(
-        key=lambda x: abs(float(x.get("price24hPcnt", 0))),
-        reverse=True
-    )
-    symbols = [t["symbol"] for t in usdt_pairs[:n]]
-    log.info(f"Top {n} volátiles: {symbols}")
-    return symbols
+def clean_html(raw: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def get_ohlcv(symbol: str, interval: str = "15", limit: int = 100) -> Optional[pd.DataFrame]:
-    """Descarga velas OHLCV de Bybit."""
-    result = bybit_get("/v5/market/kline", {
-        "category": "spot",
-        "symbol":   symbol,
-        "interval": interval,
-        "limit":    limit,
-    })
-    if not result:
-        return None
-
-    klines = result.get("list", [])
-    if not klines:
-        return None
-
-    # Bybit retorna: [startTime, open, high, low, close, volume, turnover]
-    df = pd.DataFrame(klines, columns=["open_time","open","high","low","close","volume","turnover"])
-    for col in ["open","high","low","close","volume"]:
-        df[col] = df[col].astype(float)
-    df["open_time"] = pd.to_datetime(df["open_time"].astype(int), unit="ms")
-    # Bybit retorna en orden descendente, invertir
-    df = df.iloc[::-1].reset_index(drop=True)
-    return df
+def normalize_url(url: str) -> str:
+    if url.startswith("//"):
+        return f"https:{url}"
+    return url
 
 
-def get_current_price(symbol: str) -> Optional[float]:
-    result = bybit_get("/v5/market/tickers", {"category": "spot", "symbol": symbol})
-    if not result:
-        return None
-    tickers = result.get("list", [])
-    if not tickers:
-        return None
-    return float(tickers[0].get("lastPrice", 0))
-
-# ─── Indicadores técnicos ────────────────────────────────────────────────────
-def calc_rsi(series: pd.Series, period: int = 14) -> float:
-    delta = series.diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    rsi   = 100 - (100 / (1 + rs))
-    return round(float(rsi.iloc[-1]), 2)
+def get_domain(url: str) -> str:
+    return urlparse(url).netloc.lower()
 
 
-def calc_macd(series: pd.Series):
-    ema12  = series.ewm(span=12, adjust=False).mean()
-    ema26  = series.ewm(span=26, adjust=False).mean()
-    macd   = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist   = macd - signal
-    return (
-        round(float(macd.iloc[-1]), 6),
-        round(float(signal.iloc[-1]), 6),
-        round(float(hist.iloc[-1]), 6),
-    )
+def contains_relative_date(text: str) -> bool:
+    lowered = text.lower()
+    return any(term in lowered for term in RELATIVE_DATE_TERMS)
 
 
-def calc_bollinger(series: pd.Series, period: int = 20):
-    sma   = series.rolling(period).mean()
-    std   = series.rolling(period).std()
-    upper = sma + 2 * std
-    lower = sma - 2 * std
-    price = series.iloc[-1]
-    denom = upper.iloc[-1] - lower.iloc[-1]
-    pct_b = (price - lower.iloc[-1]) / denom if denom != 0 else 0.5
-    return (
-        round(float(upper.iloc[-1]), 6),
-        round(float(sma.iloc[-1]), 6),
-        round(float(lower.iloc[-1]), 6),
-        round(float(pct_b), 4),
-    )
+def has_exclusive_signal(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in EXCLUSIVE_TOKENS)
 
 
-def analyze_symbol(symbol: str) -> Optional[dict]:
-    df = get_ohlcv(symbol)
-    if df is None or len(df) < 30:
-        return None
-
-    close       = df["close"]
-    volume      = df["volume"]
-    price       = close.iloc[-1]
-    rsi         = calc_rsi(close)
-    macd_v, macd_sig, macd_hist = calc_macd(close)
-    bb_upper, bb_mid, bb_lower, pct_b = calc_bollinger(close)
-
-    vol_avg     = float(volume.rolling(20).mean().iloc[-1])
-    vol_current = float(volume.iloc[-1])
-    vol_ratio   = round(vol_current / vol_avg, 2) if vol_avg else 1.0
-    chg_1h      = round((price / float(close.iloc[-4]) - 1) * 100, 2)
-    chg_4h      = round((price / float(close.iloc[-16]) - 1) * 100, 2)
-
-    return {
-        "symbol":      symbol,
-        "price":       round(price, 6),
-        "rsi":         rsi,
-        "macd":        macd_v,
-        "macd_signal": macd_sig,
-        "macd_hist":   macd_hist,
-        "bb_upper":    bb_upper,
-        "bb_mid":      bb_mid,
-        "bb_lower":    bb_lower,
-        "pct_b":       pct_b,
-        "vol_ratio":   vol_ratio,
-        "chg_1h":      chg_1h,
-        "chg_4h":      chg_4h,
-    }
-
-# ─── Groq AI ─────────────────────────────────────────────────────────────────
-def ai_decision(indicators: dict, has_position: bool) -> dict:
-    position_info = (
-        "El bot YA tiene posición abierta en este activo."
-        if has_position else
-        "El bot NO tiene posición abierta en este activo."
-    )
-    prompt = f"""Eres un trader cuantitativo experto. Analiza estos indicadores técnicos y decide si comprar, vender o esperar.
-
-Símbolo: {indicators['symbol']}
-Precio actual: {indicators['price']}
-{position_info}
-
-Indicadores:
-- RSI(14): {indicators['rsi']}
-- MACD: {indicators['macd']} | Signal: {indicators['macd_signal']} | Histograma: {indicators['macd_hist']}
-- Bollinger Bands: Upper={indicators['bb_upper']} | Mid={indicators['bb_mid']} | Lower={indicators['bb_lower']} | %B={indicators['pct_b']}
-- Volumen relativo (vs media 20): {indicators['vol_ratio']}x
-- Cambio 1h: {indicators['chg_1h']}%
-- Cambio 4h: {indicators['chg_4h']}%
-
-Reglas estrictas:
-- Solo recomienda BUY si NO hay posición abierta
-- Solo recomienda SELL si HAY posición abierta
-- HOLD si la señal no es clara o el riesgo es alto
-
-Responde ÚNICAMENTE con JSON válido, sin markdown, sin texto extra:
-{{"action": "buy|sell|hold", "confidence": 0-100, "reason": "máximo 2 oraciones"}}"""
-
-    try:
-        resp = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=200,
-        )
-        raw = resp.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        result = json.loads(raw)
-        result["action"] = result["action"].lower()
-        if result["action"] not in ("buy", "sell", "hold"):
-            result["action"] = "hold"
-        return result
-    except Exception as e:
-        log.error(f"Groq error: {e}")
-        return {"action": "hold", "confidence": 0, "reason": "Error en IA."}
-
-# ─── Telegram ────────────────────────────────────────────────────────────────
-def send_telegram(msg: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML"
-        }, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        log.error(f"Telegram error: {e}")
-
-# ─── Paper trading ────────────────────────────────────────────────────────────
-def execute_buy(symbol: str, price: float, reason: str, confidence: int):
-    usdt   = portfolio["usdt_balance"]
-    invest = usdt * MAX_POSITION_PCT
-    if invest < 10:
-        return
-    qty = invest / price
-    portfolio["positions"][symbol] = {
-        "qty": qty, "entry_price": price,
-        "entry_time": datetime.now(timezone.utc).isoformat(),
-        "invested": invest,
-    }
-    portfolio["usdt_balance"] -= invest
-    portfolio["trades"].append({
-        "type": "buy", "symbol": symbol, "price": price,
-        "qty": qty, "usdt": invest,
-        "time": datetime.now(timezone.utc).isoformat(),
-        "reason": reason, "confidence": confidence,
-    })
-    save_history()
-    send_telegram(
-        f"🟢 <b>COMPRA — {symbol}</b>\n"
-        f"💰 Precio: <code>${price:.6f}</code>\n"
-        f"📦 Cantidad: <code>{qty:.4f}</code>\n"
-        f"💵 Invertido: <code>${invest:.2f} USDT</code>\n"
-        f"🧠 Confianza IA: <code>{confidence}%</code>\n"
-        f"📝 {reason}\n"
-        f"💼 Saldo restante: <code>${portfolio['usdt_balance']:.2f} USDT</code>"
-    )
-    log.info(f"BUY {symbol} @ {price} | ${invest:.2f}")
+def is_scam_like(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in BLOCKED_SOURCE_TERMS)
 
 
-def execute_sell(symbol: str, price: float, reason: str, confidence: int):
-    pos = portfolio["positions"].get(symbol)
-    if not pos:
-        return
-    qty      = pos["qty"]
-    entry    = pos["entry_price"]
-    proceeds = qty * price
-    pnl      = proceeds - pos["invested"]
-    pnl_pct  = (pnl / pos["invested"]) * 100
-    portfolio["usdt_balance"] += proceeds
-    portfolio["total_pnl"]    += pnl
-    del portfolio["positions"][symbol]
-    portfolio["trades"].append({
-        "type": "sell", "symbol": symbol,
-        "price": price, "qty": qty,
-        "entry_price": entry, "pnl": pnl, "pnl_pct": pnl_pct,
-        "time": datetime.now(timezone.utc).isoformat(),
-        "reason": reason, "confidence": confidence,
-    })
-    save_history()
-    emoji = "🟢" if pnl >= 0 else "🔴"
-    send_telegram(
-        f"{emoji} <b>VENTA — {symbol}</b>\n"
-        f"💰 Precio salida: <code>${price:.6f}</code>\n"
-        f"📥 Precio entrada: <code>${entry:.6f}</code>\n"
-        f"📦 Cantidad: <code>{qty:.4f}</code>\n"
-        f"{'✅' if pnl >= 0 else '❌'} PnL: <code>${pnl:+.2f} ({pnl_pct:+.2f}%)</code>\n"
-        f"🧠 Confianza IA: <code>{confidence}%</code>\n"
-        f"📝 {reason}\n"
-        f"💼 Balance USDT: <code>${portfolio['usdt_balance']:.2f}</code>\n"
-        f"📊 PnL Total: <code>${portfolio['total_pnl']:+.2f}</code>"
-    )
-    log.info(f"SELL {symbol} @ {price} | PnL ${pnl:+.2f} ({pnl_pct:+.2f}%)")
-
-# ─── Historial ────────────────────────────────────────────────────────────────
-def save_history():
-    with open(HISTORY_FILE, "w") as f:
-        json.dump({
-            "updated":      datetime.now(timezone.utc).isoformat(),
-            "usdt_balance": portfolio["usdt_balance"],
-            "total_pnl":    portfolio["total_pnl"],
-            "positions":    portfolio["positions"],
-            "trades":       portfolio["trades"][-500:],
-        }, f, indent=2)
-
-
-def load_history():
-    if not os.path.exists(HISTORY_FILE):
-        return
-    try:
-        with open(HISTORY_FILE) as f:
-            data = json.load(f)
-        portfolio["usdt_balance"] = data.get("usdt_balance", INITIAL_BALANCE)
-        portfolio["total_pnl"]    = data.get("total_pnl", 0.0)
-        portfolio["positions"]    = data.get("positions", {})
-        portfolio["trades"]       = data.get("trades", [])
-        log.info(f"Historial cargado: ${portfolio['usdt_balance']:.2f}, {len(portfolio['positions'])} posiciones")
-    except Exception as e:
-        log.error(f"Error cargando historial: {e}")
-
-# ─── Resumen ──────────────────────────────────────────────────────────────────
-def portfolio_summary() -> str:
-    lines = [
-        "📊 <b>RESUMEN DE PORTAFOLIO</b>",
-        f"💵 Balance USDT: <code>${portfolio['usdt_balance']:.2f}</code>",
-        f"📈 PnL total: <code>${portfolio['total_pnl']:+.2f}</code>",
-        f"🔄 Ciclo actual: <code>#{portfolio['cycle']}</code>",
-    ]
-    if portfolio["positions"]:
-        lines.append("\n🔓 <b>Posiciones abiertas:</b>")
-        for sym, pos in portfolio["positions"].items():
-            price = get_current_price(sym)
-            if price:
-                unrealized = (price - pos["entry_price"]) * pos["qty"]
-                pct        = ((price / pos["entry_price"]) - 1) * 100
-                lines.append(
-                    f"  • {sym}: <code>${price:.6f}</code> | "
-                    f"PnL: <code>${unrealized:+.2f} ({pct:+.2f}%)</code>"
-                )
-    else:
-        lines.append("🔓 Sin posiciones abiertas")
-
-    closed = [t for t in portfolio["trades"] if t["type"] == "sell"]
-    wins   = [t for t in closed if t.get("pnl", 0) > 0]
-    wr     = (len(wins) / len(closed) * 100) if closed else 0
-    lines.append(f"\n🎯 Trades cerrados: {len(closed)} | Win rate: {wr:.1f}%")
-    return "\n".join(lines)
-
-# ─── Loop de trading ──────────────────────────────────────────────────────────
-def trading_loop():
-    time.sleep(5)
-    send_telegram(
-        "🚀 <b>Paper Trading Bot iniciado</b>\n"
-        f"💵 Balance: <code>${portfolio['usdt_balance']:.2f} USDT</code>\n"
-        f"📡 Exchange: Bybit (datos públicos)\n"
-        f"🔄 Ciclos cada {SCAN_INTERVAL // 60} minutos\n"
-        f"🎯 Top {TOP_N_VOLATILE} pares más volátiles\n"
-        f"🧠 Confianza mínima: {MIN_CONFIDENCE}%"
-    )
-
-    while True:
+def extract_explicit_dates(text: str) -> list[str]:
+    dates: set[str] = set()
+    for year, month, day in re.findall(r"\b(202\d)[-/](\d{1,2})[-/](\d{1,2})\b", text):
         try:
-            portfolio["cycle"] += 1
-            log.info(f"─── Ciclo #{portfolio['cycle']} ───")
+            dates.add(datetime(int(year), int(month), int(day)).date().isoformat())
+        except ValueError:
+            continue
+    for day, month_name, year in re.findall(
+        r"\b(\d{1,2})\s+de\s+([a-záéíóú]+)\s+de\s+(202\d)\b", text.lower()
+    ):
+        month = MONTHS.get(month_name)
+        if not month:
+            continue
+        try:
+            dates.add(datetime(int(year), month, int(day)).date().isoformat())
+        except ValueError:
+            continue
+    return sorted(dates)
 
-            symbols      = get_top_volatile_symbols()
-            open_symbols = list(portfolio["positions"].keys())
-            all_symbols  = list(dict.fromkeys(symbols + open_symbols))
 
-            if not all_symbols:
-                log.warning("Sin símbolos, saltando ciclo.")
-            else:
-                for sym in all_symbols:
-                    indicators = analyze_symbol(sym)
-                    if not indicators:
-                        continue
-                    has_pos    = sym in portfolio["positions"]
-                    decision   = ai_decision(indicators, has_pos)
-                    action     = decision["action"]
-                    confidence = decision.get("confidence", 0)
-                    reason     = decision.get("reason", "")
+def qualifies_source(url: str, title: str, snippet: str, page_text: str) -> tuple[bool, str]:
+    domain = get_domain(url)
+    combined = " ".join([title, snippet, page_text]).lower()
+    explicit_dates = extract_explicit_dates(combined)
 
-                    if action == "buy" and not has_pos and confidence >= MIN_CONFIDENCE:
-                        execute_buy(sym, indicators["price"], reason, confidence)
-                    elif action == "sell" and has_pos and confidence >= MIN_CONFIDENCE:
-                        execute_sell(sym, indicators["price"], reason, confidence)
-                    else:
-                        log.info(f"HOLD {sym} | {action} {confidence}%")
-                    time.sleep(0.5)
+    if domain in BLOCKED_DOMAINS:
+        return False, f"dominio bloqueado: {domain}"
+    if is_scam_like(combined):
+        return False, "patrones de estafa o captación"
+    if not has_exclusive_signal(combined):
+        return False, "sin señales de exclusividad"
+    if "santiago" not in combined and not any(commune in combined for commune in ("providencia", "vitacura", "las condes", "ñuñoa", "nunoa", "lo barnechea")):
+        return False, "sin ubicación clara en Santiago"
+    if contains_relative_date(combined) and not explicit_dates:
+        return False, "solo fecha relativa sin fecha absoluta"
+    if not explicit_dates:
+        return False, "sin fecha absoluta verificable"
+    if not any(date.startswith("2026-") for date in explicit_dates):
+        return False, "sin fecha explícita de 2026"
+    if all(datetime.fromisoformat(date).date() <= DATE_CUTOFF for date in explicit_dates if date.startswith("2026-")):
+        return False, "sin fechas posteriores al corte"
+    return True, "ok"
 
-            if portfolio["cycle"] % 12 == 0:
-                send_telegram(portfolio_summary())
 
-        except Exception as e:
-            log.error(f"Error en ciclo: {e}", exc_info=True)
-            send_telegram(f"⚠️ Error en ciclo #{portfolio['cycle']}: {e}")
+def duckduckgo_search(query: str, limit: int = SEARCH_RESULTS) -> list[SearchResult]:
+    url = f"https://html.duckduckgo.com/html/?kl={quote_plus(SEARCH_LOCALE)}&q={quote_plus(query)}"
+    resp = session.get(url, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    html = resp.text
 
-        time.sleep(SCAN_INTERVAL)
+    results: list[SearchResult] = []
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
+        r'(?:<a[^>]+class="result__snippet"[^>]*>(?P<snippet_a>.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(?P<snippet_div>.*?)</div>)',
+        re.S,
+    )
+    for match in pattern.finditer(html):
+        target = normalize_url(unescape(match.group("url")))
+        if not target.startswith("http"):
+            target = urljoin("https://html.duckduckgo.com", target)
+        title = clean_html(match.group("title"))
+        snippet = clean_html(match.group("snippet_a") or match.group("snippet_div") or "")
+        if title and target:
+            results.append(SearchResult(title=title, url=target, snippet=snippet))
+        if len(results) >= limit:
+            break
+    return results
 
-# ─── Telegram command handlers ────────────────────────────────────────────────
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(portfolio_summary(), parse_mode="HTML")
 
-async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trades = [t for t in portfolio["trades"] if t["type"] == "sell"][-10:]
-    if not trades:
-        await update.message.reply_text("Sin trades cerrados aún.")
-        return
-    lines = ["📋 <b>Últimos 10 trades cerrados:</b>"]
-    for t in reversed(trades):
-        e = "✅" if t.get("pnl", 0) >= 0 else "❌"
-        lines.append(
-            f"{e} {t['symbol']} | <code>${t.get('pnl',0):+.2f} ({t.get('pnl_pct',0):+.2f}%)</code> "
-            f"@ {t['time'][:10]}"
+def fetch_page_text(url: str) -> str:
+    try:
+        resp = session.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        resp.raise_for_status()
+        return clean_html(resp.text)[:MAX_SOURCE_CHARS]
+    except Exception as exc:
+        log.warning("No se pudo leer %s: %s", url, exc)
+        return ""
+
+
+def build_sources() -> list[dict]:
+    sources: list[dict] = []
+    seen: set[str] = set()
+
+    for query in SEARCH_QUERIES:
+        try:
+            for result in duckduckgo_search(query):
+                if result.url in seen:
+                    continue
+                seen.add(result.url)
+                page_text = fetch_page_text(result.url)
+                if not page_text:
+                    continue
+                valid, reason = qualifies_source(result.url, result.title, result.snippet, page_text)
+                if not valid:
+                    log.info("Fuente descartada %s -> %s", result.url, reason)
+                    continue
+                combined = " ".join([result.title, result.snippet, page_text])
+                sources.append(
+                    {
+                        "query": query,
+                        "title": result.title,
+                        "url": result.url,
+                        "domain": get_domain(result.url),
+                        "snippet": result.snippet,
+                        "explicit_dates": extract_explicit_dates(combined),
+                        "content": page_text,
+                    }
+                )
+        except Exception as exc:
+            log.warning("Falló la búsqueda '%s': %s", query, exc)
+
+    return sources
+
+
+AI_SCHEMA_EXAMPLE = {
+    "generated_at": "2026-03-20T12:00:00Z",
+    "criteria": {
+        "city": "Santiago de Chile",
+        "country": "Chile",
+        "from_date_exclusive": "2026-03-18",
+        "year": 2026,
+    },
+    "events": [
+        {
+            "title": "Ejemplo",
+            "date": "2026-03-25",
+            "venue": "Vitacura, Santiago, Chile",
+            "category": "inauguración | degustación gratis | lanzamiento VIP",
+            "exclusive_reason": "Apertura privada con cupos limitados",
+            "summary": "Qué ocurrirá en una frase",
+            "audience": "Adultos / foodies / prensa / invitados",
+            "price": "Gratis con inscripción",
+            "why_verified": "La fuente menciona explícitamente Santiago y la fecha 2026-03-25.",
+            "source_url": "https://...",
+            "source_title": "Página fuente",
+            "source_domain": "eventrid.cl",
+            "source_date_text": "25 de marzo de 2026",
+        }
+    ],
+}
+
+
+def extract_events_with_ai(sources: list[dict]) -> dict:
+    if client is None:
+        raise RuntimeError("Falta GROQ_API_KEY para procesar eventos.")
+    prompt = f"""
+Eres un curador de agenda premium extremadamente estricto.
+
+Fecha de corte obligatoria: solo eventos POSTERIORES a {DATE_CUTOFF.isoformat()}.
+Ciudad obligatoria: solo Santiago de Chile.
+Año obligatorio: solo 2026.
+
+Objetivo:
+- Encontrar eventos exclusivos/premium/privados/de cupos limitados.
+- Incluir especialmente inauguraciones, aperturas, lanzamientos, degustaciones gratis, catas gratis y experiencias VIP.
+- Excluir redes sociales, reels, videos, publicaciones ambiguas, artículos sin fecha absoluta de 2026, y cualquier publicación que parezca estafa, captación o multinivel.
+- Excluir cualquier evento de 2025, cualquier evento fuera de Santiago de Chile, cualquier evento sin fecha verificable, cualquier evento con fecha igual o anterior a {DATE_CUTOFF.isoformat()}, y cualquier evento genérico sin rasgo de exclusividad.
+- Si una fuente parece describir un video, un resumen periodístico de un evento pasado o una obra pública sin convocatoria real, descártala.
+- No inventes datos.
+
+Entrega JSON válido con EXACTAMENTE esta forma:
+{json.dumps(AI_SCHEMA_EXAMPLE, ensure_ascii=False)}
+
+Reglas adicionales:
+- `date` debe estar en formato YYYY-MM-DD.
+- `source_date_text` debe ser el texto de fecha observado en la fuente.
+- `why_verified` debe explicar por qué sí cumple los filtros.
+- Ordena por fecha ascendente.
+- Devuelve máximo {MAX_EVENTS} eventos.
+- Si no hay suficientes eventos verificados, devuelve una lista vacía en `events`.
+
+Fuentes:
+{json.dumps(sources, ensure_ascii=False)}
+"""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        temperature=0.05,
+        max_tokens=2200,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+    payload = response.choices[0].message.content.strip()
+    data = json.loads(payload)
+    data["events"] = post_filter_events(data.get("events", []))
+    return data
+
+
+def post_filter_events(events: Iterable[dict]) -> list[dict]:
+    filtered: list[dict] = []
+    for event in events:
+        try:
+            event_date = datetime.fromisoformat(str(event.get("date", ""))).date()
+        except ValueError:
+            continue
+        text_blob = " ".join(
+            str(event.get(key, ""))
+            for key in (
+                "title",
+                "venue",
+                "category",
+                "exclusive_reason",
+                "summary",
+                "why_verified",
+                "source_title",
+                "source_domain",
+                "source_date_text",
+                "audience",
+                "price",
+            )
+        ).lower()
+        source_url = str(event.get("source_url", ""))
+        source_domain = str(event.get("source_domain") or get_domain(source_url)).lower()
+        source_date_text = str(event.get("source_date_text", "")).strip()
+
+        if event_date <= DATE_CUTOFF or event_date.year != 2026:
+            continue
+        if source_domain in BLOCKED_DOMAINS:
+            continue
+        if is_scam_like(text_blob):
+            continue
+        if not source_date_text:
+            continue
+        if contains_relative_date(source_date_text) and not extract_explicit_dates(source_date_text):
+            continue
+        if not extract_explicit_dates(source_date_text) and not extract_explicit_dates(text_blob):
+            continue
+        if "santiago" not in text_blob and not any(commune in text_blob for commune in ("providencia", "vitacura", "las condes", "ñuñoa", "nunoa", "lo barnechea")):
+            continue
+        if not has_exclusive_signal(text_blob):
+            continue
+        filtered.append(
+            {
+                **event,
+                "source_domain": source_domain,
+                "price": event.get("price", "No especificado"),
+                "audience": event.get("audience", "No especificado"),
+            }
         )
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    filtered.sort(key=lambda item: item["date"])
+    return filtered[:MAX_EVENTS]
+
+
+def format_events_message(data: dict) -> str:
+    events = data.get("events", [])
+    header = (
+        "✨ <b>Agenda exclusiva verificada — Santiago de Chile</b>\n"
+        f"📅 Solo eventos posteriores al <code>{DATE_CUTOFF.isoformat()}</code> y dentro de 2026.\n"
+        "🧪 Se excluyen reels, TikToks, fechas relativas, artículos viejos y señales de estafa."
+    )
+    if not events:
+        return header + "\n\nNo encontré eventos suficientemente verificados que cumplan todos los filtros."
+
+    lines = [header]
+    for idx, event in enumerate(events, start=1):
+        lines.append(
+            "\n".join(
+                [
+                    f"<b>{idx}. {event['title']}</b>",
+                    f"🗓️ Fecha verificada: <code>{event['date']}</code> ({event.get('source_date_text', 'sin texto fuente')})",
+                    f"📍 Lugar: {event['venue']}",
+                    f"🏷️ Tipo: {event['category']}",
+                    f"🔒 Exclusividad: {event['exclusive_reason']}",
+                    f"👥 Público: {event.get('audience', 'No especificado')}",
+                    f"💸 Precio: {event.get('price', 'No especificado')}",
+                    f"✅ Verificación: {event.get('why_verified', 'Fuente con fecha absoluta y ubicación verificable.')}",
+                    f"📝 Resumen: {event['summary']}",
+                    f"🌐 Fuente: {event.get('source_title', event.get('source_domain', 'fuente'))} — {event.get('source_domain', '')}",
+                    f"🔗 {event['source_url']}",
+                ]
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def discover_events() -> dict:
+    sources = build_sources()
+    if not sources:
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "criteria": {
+                "city": "Santiago de Chile",
+                "country": "Chile",
+                "from_date_exclusive": DATE_CUTOFF.isoformat(),
+                "year": 2026,
+            },
+            "events": [],
+        }
+    return extract_events_with_ai(sources)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hola. Usa /eventos para recibir una agenda verificada de eventos exclusivos en Santiago, Chile, posteriores al 2026-03-18.",
+    )
+
+
+async def cmd_eventos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Buscando inauguraciones, degustaciones gratis y experiencias exclusivas verificadas en Santiago…"
+    )
+    try:
+        data = discover_events()
+        await update.message.reply_text(
+            format_events_message(data),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        log.exception("Error buscando eventos")
+        await update.message.reply_text(f"Ocurrió un error buscando eventos: {exc}")
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 <b>Crypto Paper Trading Bot</b>\n\n"
-        "/status — Portafolio actual y posiciones abiertas\n"
-        "/trades — Últimos 10 trades cerrados\n"
-        "/help   — Este mensaje",
-        parse_mode="HTML"
+        "/eventos — Busca eventos exclusivos 2026 en Santiago de Chile posteriores al 18 de marzo de 2026.\n"
+        "/start — Mensaje inicial.\n"
+        "/help — Ayuda."
     )
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+
 def main():
-    load_history()
-    threading.Thread(target=trading_loop, daemon=True).start()
+    if not GROQ_API_KEY:
+        raise RuntimeError("Debes definir GROQ_API_KEY.")
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Debes definir TELEGRAM_TOKEN.")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("trades", cmd_trades))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    log.info("Telegram bot iniciado (main thread).")
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("eventos", cmd_eventos))
+    app.add_handler(CommandHandler("help", cmd_help))
+    log.info("Bot de eventos iniciado.")
     app.run_polling()
 
 
